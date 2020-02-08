@@ -430,7 +430,7 @@ function main()
 			search_target
 		})
 		
-		if #arg == 2 then
+		if #arg <= 2 then
 			search_packet = search_packet .. "\0"
 		elseif #arg == 3 then
 			search_packet = search_packet .. "\x00\x80\1"..string.pack("<s2", arg[3])
