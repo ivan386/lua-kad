@@ -1,0 +1,15 @@
+[submodule "lua-md4"]
+	path = lua-md4
+	url = https://github.com/ivan386/lua-md4
+[submodule "lua-md5"]
+	path = lua-md5
+	url = https://github.com/ivan386/lua-md5
+[submodule "lua-rc4"]
+	path = lua-rc4
+	url = https://github.com/ivan386/lua-rc4
+[submodule "deflate"]
+	path = deflate
+	url = https://github.com/safeteeWow/LibDeflate.git
+[submodule "lua-asp"]
+	path = lua-asp
+	url = D:/Develop/lua-advanced-string-pack
