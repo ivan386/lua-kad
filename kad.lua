@@ -26,7 +26,7 @@ local kad2_packet_format = ([[
 			ED2K_PROTOCOL_KAD:
 				(B)
 					{
-						 KADEMLIA2_REQ               : B c16
+						 KADEMLIA2_REQ               : B c16 ]]--[[c16]]..[[
 						,KADEMLIA2_RES               : c16 [B] {c16 c4 <H <H B}
 						,KADEMLIA2_SEARCH_KEY_REQ    : c16 ]]--[[(<H) {0x8000: (B) {0: B, <s2, <s2 <s2, <L B <s2, 8: <I8 B <s2} }]]..[[
 						,KADEMLIA2_SEARCH_SOURCE_REQ : c16 <H <I8
@@ -44,22 +44,22 @@ local kad2_packet_format = ([[
 :gsub("KADEMLIA2_REQ", KADEMLIA2_REQ)
 :gsub("KADEMLIA2_RES", KADEMLIA2_RES)
 
-
 --[[
  с16 это строка в 16 байт. Ей может быть ID получателя либо целевой хеш
  с4 это ipv4 адрес(перевёрнутый) за ним сразу следуют два <H это два номера порта UDP и TCP
 --]]
 
+-- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/routing/RoutingZone.cpp#L135
 -- формат файла списка узлов
 local bootstrap_list_format = [[
 	(*[<L]{c16 c4 <H <H B})
 	{
 		0:
 			(<L)
-			[<L]
 			{
-				 1: c16 c4 <H <H B
-				,2: c16 c4 <H <H B c4 c4 B
+				  [<L] {c16 c4 <H <H B         }
+				, [<L] {c16 c4 <H <H B c4 c4 B }
+				, (<L) {[<L] { c16 c4 <H <H B }}
 			}
 	}
 ]]
@@ -74,21 +74,36 @@ function send_packet(data, receiver_id, sender_key, ip, port, socket)
 	-- В случае использования в качестве ключа ID узла значение этих бит равно 0.
 	
 	local first_byte = math.random(0, 255) & (255 << 2)
+	
+	-- Необходимо проверить что значение этого байта не совпадает с идентификаторами протокола
+	-- На самом деле проверок должно быть больше. Может я и переделаю эту часть.
+	
 	while first_byte == ED2K_PROTOCOL_KAD do
 		first_byte = math.random(0, 255) & (255 << 2)
 	end
 	
+	-- Генерируем два случайных байта. Они участвуют в генерации ключа пакета.
 	local two_random_bytes = string.pack("<I2", math.random(1<<16 - 1))  
 	
-	-- дополняем
-	-- magic_value(<I4) padding(B) receiver_key(<I4) sender_key(<I4) data
-	data = MAGICVALUE_UDP_SYNC_CLIENT.."\0".."\0\0\0\0"..sender_key..data
+	-- Дополняем данные которые будем шифровать дополнительными значениями.
+	-- Эти значения позволяют проверить что пакет рашифрован правильно.
+	-- А так же мы передаём здесь свой ключь.
+
+	--     magic_value(<I4)              padding(B)    
+	data = MAGICVALUE_UDP_SYNC_CLIENT .. "\0"
+	--        мы не знаем ключь получателя(receiver_key) поэтому заполняем его нулями
+	--        receiver_key(<I4)   sender_key(<I4)
+		   .. "\0\0\0\0"        ..sender_key      
+		   ..data
 	
 	-- шифруем
 	-- в данном случае для шифрования мы используем ID получателя
+	-- мы соеденяем ID и два случайных байта и md5 от этой строки будет ключём шифрования пакета
 	data = rc4(md5(receiver_id..two_random_bytes), data)
 	
 	-- дополняем шифрованный пакет необходимыми для расшифрофки данными
+	-- first_byte - позволяет предположить что это шифрованный пакет
+	-- two_random_bytes - используются для генерации ключа и расшифровки
 	data = string.char(first_byte)..two_random_bytes..data
 	
 	-- отправляем
@@ -98,40 +113,64 @@ end
 
 function receive_packet(socket)
 	local data, ip, port = socket:receivefrom()
-	
-	if data and #data > 3 + 4 + 1 + 4 + 4 + 2 and data:byte() & 3 == 2 then -- 2 означает что при шифровании использовался наш ключ
+	-- 1. Проверяем что мы что то получили
+	-- 2. Проверяем что данных достаточно для расшифровки (открытый заголовок + шифрованный заголовок + минимум 2 байта данных)
+	-- 3. Проверяем тип шифрования. В нашем случае это только шифрование с использованием ключа то есть значение 2.
+	if data and #data > 3 + 4 + 1 + 4 + 4 + 2 and data:byte() & 3 == 2 then
 		
 		-- расшифровываем
+		-- конкатенируем свой ключь и два байта(случайных) со второй позиции
+		-- md5 от этого сочетания это ключь пакета
+		-- с 4 байта в data идут зашифрованные данные
 		local edata = rc4(md5(my_key..data:sub(2,3)), data, 4)
 		
 		-- проверяем
+		-- первым в расшифрованных данных должен быть MAGICVALUE_UDP_SYNC_CLIENT
 		local magic_value, next_pos = ("c4"):unpack(edata)
 		if magic_value == MAGICVALUE_UDP_SYNC_CLIENT then
+			-- далее идет отступ(padding) который нас не интересует и обычно занимает один байт в UDP пакете
+			-- потом идет receiver_key 
 			_, receiver_key, next_pos = ("s1 c4"):unpack(edata, next_pos)
 			
+			-- receiver_key должен быть равен нашему ключу который участвовал в генерации ключа пакета
 			if receiver_key == my_key then
+				-- если всё правльно то записываем в data расшифрованный пакет
 				data = edata:sub(next_pos + 4)
 			end
 		end
 	end
+	
+	-- на этом этапе у нас либо рашифрованный пакет либо не известные данные
 
+	-- проверяем идентификатор протокола в первом байте
+	
 	if data and data:byte() == ED2K_PROTOCOL_KAD then
+		-- это не сжатый пакет
 		return data, ip, port
 	end
 
-	if data and data:byte() == ED2K_PROTOCOL_KAD_PACKED then -- сжатый пакет
+	if data and data:byte() == ED2K_PROTOCOL_KAD_PACKED then 
+		-- это сжатый пакет
 		
 		-- разжимаем
+		-- сжатые данные начинаются с 3 позиции
 		local cdata, err = deflate:DecompressZlib(data:sub(3))
 		if cdata then
-			-- меняем 
+			-- меняем идентификатор протокола на не сжатый
+			-- на второй позиции находится не сжатый код операции
+			-- копируем код операции перед разжатыми данными
 			return string.char(ED2K_PROTOCOL_KAD, data:byte(2))..cdata, ip, port
 		end
 	end	
 end
 
 function unpack_ip(data)
-	return ("%u.%u.%u.%u"):format(data:reverse():byte(1,4))
+	if type(data) == "string" then
+		return ("%u.%u.%u.%u"):format(data:reverse():byte(1,4))
+		
+	elseif type(data) == "number" then
+		return ("%u.%u.%u.%u"):format(data & 255, data >> 8 & 255, data >> 16 & 255, data >> 24 & 255)
+	end
 end
 
 function reverse_hash(hash)
@@ -257,124 +296,205 @@ local ed2k_link_only, magnet_link_only, tags_only
 function print_results(results)
 	for _, result in ipairs(results) do
 		
-		if not printed[result[1]] then
-			printed[result[1]] = true
-			local id_or_hash, source, aich, file_name, file_size, bitrate, length = reverse_hash(result[1]):tohex(), ""
+		local   hash_or_id  -- если запрос был на поиск файла то здесь его хеш
+                            -- если запрос был на поиск источников то здесь id источника 
+			  , tag_count   -- количество тегов
+			  , tags        -- теги с информацией о файла либо источнике
+			  = table.unpack(result)
+		
+		if not printed[hash_or_id] then
+			printed[hash_or_id] = true
+			
+			hash_or_id = reverse_hash(hash_or_id):tohex()
+			local source_ip, source_port, aich, file_name, file_size, bitrate
+			
 			if not (ed2k_link_only or magnet_link_only) then
 				io.stdout:write("\n")
 			end
-			for _, tag in ipairs(result[3]) do
 			
-				local tag_name, tag_value = TAGS[tag[2]] or tag[2], tag[3][1]
+			for _, tag in ipairs(tags) do
 			
+				local tag_type,       -- здесь идентификатор фомата тега
+					  tag_name,       -- имя тега обычно строка в один байт
+					  tag_value_table -- это таблица из которой мы возьмём значение 
+					  = table.unpack(tag)
+				
+				local tag_value = tag_value_table[1] -- обычно в таблице одно значение
+				
+				if TAGS[tag_name] then        -- если есть полное имя для тега
+					tag_name = TAGS[tag_name] -- даём более информативное имя тегу
+				end
+			
+				-- заполним переменные для магнита или ed2k ссылки
 				if tag_name == "TAG_FILENAME" then
-					file_name = tag_value
+					file_name = tag_value            -- имя файла
+					
 				elseif tag_name == "TAG_FILESIZE" then
-					file_size = tag_value
+					file_size = tag_value            -- размер файла
+					
 				elseif tag_name == "TAG_MEDIA_BITRATE" then
-					bitrate = tag_value * 1024
+					bitrate = tag_value * 1024       -- битрейт в теге указан в килобитах
+					
 				elseif tag_name == "TAG_SOURCEIP" then
-					source = table.concat({(">L"):pack(tag_value):byte(1,4)}, ".") .. (source or "")
+					source_ip = unpack_ip(tag_value) -- распаковываем ip из числа в строку
+					
 				elseif tag_name == "TAG_SOURCEPORT" then
-					source = (source or "") .. ":" .. tag_value
+					source_port = tag_value          -- tcp порт источника
+					
 				elseif tag_name == "TAG_KADAICHHASHRESULT" then
-					local aich_result = ("[B]{B c20}"):unpack(tag_value, 1, true)
-					if aich_result and aich_result[1] > 0 then
-						aich = aich_result[2][1][2]:tob32()
+					-- проверим что данных достаточно для чтения
+					if #tag_value >= 22 then
+						-- в данном случае мы читаем только первый aich хеш а остальные пропускаем
+						local aich_count, aich_sources, aich_hash = ("B B c20"):unpack(tag_value)
+						if aich_hash then
+							aich = aich_hash:tob32() -- записываем хеш
+						end
 					end
 				end
 				
 				if not (ed2k_link_only or magnet_link_only) then
-					if tag_name == "TAG_KADAICHHASHRESULT" then
-						local aich_result = ("[B]{B c20}"):unpack(tag_value, 1, true)
-						io.stdout:write(tag_name, ":\t", aich_result[1])
-						for _, aich_variant in ipairs(aich_result[2]) do
-							io.stdout:write("\n\t\t", aich_variant[1],  ", ", aich)
-						end
-						
-					elseif tag_name == "TAG_MEDIA_BITRATE" then
-						io.stdout:write(tag_name, ":\t", tag_value * 1024)
-						if file_size and length then
-							io.stdout:write(" (", math.ceil(file_size * 8 / length), ")")
-						end
-						
-					elseif tag_name == "TAG_MEDIA_LENGTH" then
-						length = tag_value
-						io.stdout:write(tag_name, ":\t", math.floor(length / 60^2), ":", math.floor(length / 60) % 60, ":", length % 60)
-						
-					elseif tag_name == "TAG_PUBLISHINFO" then
-						io.stdout:write(tag_name, ":\t", tag_value >> 24 & 255, "(name count), ", tag_value >> 16 & 255, "(publishers), ", (tag_value & 0xFFFF) / 100, "(trustvalue)")
-						
-					elseif tag_name == "TAG_SOURCEIP" or tag_name == "TAG_SERVERIP" then	
-						io.stdout:write(tag_name, ":\t", table.concat({(">L"):pack(tag_value):byte(1,4)}, "."))
-					
-					elseif tag_name == "TAG_FILESIZE" then	
-						io.stdout:write(tag_name, ":\t", tag_value)
-						
-						local index = 1
-						local mul = {"B", "KB", "MB", "GB", "TB"}
-						while tag_value > 1024 do
-							tag_value = tag_value >> 10
-							index = index + 1
-						end
-						
-						if index == 1 then
-							io.stdout:write(" B")
-						else
-							io.stdout:write(" B (", tag_value, " ", mul[index], ")")
-						end
-					
-					else
-						io.stdout:write(tag_name, ":\t", table.concat(tag[3],  ", "))
-						
-					end
-					
-					io.stdout:write("\n")
+					print_tag(tag_name, tag_value, tag_value_table)
 				end
 			end
 			
 			if file_name then
 				if not (ed2k_link_only or magnet_link_only) then
-					io.stdout:write("FILE_HASH:\t", id_or_hash, "\n")
+					io.stdout:write("FILE_HASH:\t", hash_or_id, "\n")
 				end
 				
-				local uri_name = file_name:gsub("[ &]", {[" "]="%20", ["&"] = "%26"})
+				local uri_name = file_name:gsub("[ &|]", {[" "]="%20", ["&"] = "%26", ["|"] = "%7C"})
 				
 				if file_size and not (magnet_link_only or tags_only) then
-					io.stdout:write(("ed2k://|file|%s|%s|%s|"):format(uri_name, file_size, id_or_hash))
-					if aich then
-						io.stdout:write("p=", aich, "|")
-					end
-					io.stdout:write("/\n")
+					print_ed2k(hash_or_id, aich, file_size, uri_name, source_ip, source_port)
 				end
 			
 				if not (ed2k_link_only or tags_only) then
-					io.stdout:write(("magnet:?xt=urn:ed2k:%s"):format(id_or_hash))
-					if aich then
-						io.stdout:write("&xt=urn:aich:" .. aich)
-					end
-					if file_size then
-						io.stdout:write("&xl=" .. file_size)
-					end
-					if bitrate then
-						io.stdout:write("&br=" .. bitrate)
-					end
-					if file_name then
-						io.stdout:write("&dn=" .. uri_name)
-					end
-					
-					io.stdout:write("\n")
+					print_magnet(hash_or_id, aich, file_size, uri_name)
 				end
-			elseif source then
+			elseif source_ip and source_port then
 				if not ed2k_link_only then
-					io.stdout:write("SOURCE_ID:\t", id_or_hash, "\n")
+					io.stdout:write("SOURCE_ID:\t", hash_or_id, "\n")
 				end
 				if file_size and not tag_only then
-					io.stdout:write(("ed2k://|file|%s|%s|%s|sources,%s|/\n"):format("s", file_size, search_target:tohex(), source))
+					print_ed2k(reverse_hash(search_target):tohex(), nil, file_size, "s", source_ip, source_port)
 				end
 			end
 		end
 	end
+end
+
+function print_ed2k(hash, aich, file_size, uri_name, source_ip, source_port)
+	io.stdout:write(("ed2k://|file|%s|%s|%s|"):format(uri_name, file_size, hash))
+	if aich then
+		io.stdout:write("p=", aich, "|")
+	end
+	if source_ip and source_port then
+		io.stdout:write("sources,", source_ip, ":", source_port, "|")
+	end
+	io.stdout:write("/\n")
+end
+
+function print_magnet(hash, aich, file_size, uri_name)
+	io.stdout:write(("magnet:?xt=urn:ed2k:%s"):format(hash))
+	if aich then
+		io.stdout:write("&xt=urn:aich:" .. aich)
+	end
+	if file_size then
+		io.stdout:write("&xl=" .. file_size)
+	end
+	if bitrate then
+		io.stdout:write("&br=" .. bitrate)
+	end
+	if uri_name then
+		io.stdout:write("&dn=" .. uri_name)
+	end
+	
+	io.stdout:write("\n")
+end
+
+function shift_value(value)
+	local count = 0
+		
+	while value >= 1024 do
+		value = value >> 10
+		count = count + 1
+	end
+	
+	return count, value
+end
+
+function print_tag(tag_name, tag_value, tag_value_table)
+	
+	if tag_name == "TAG_KADAICHHASHRESULT" then
+		-- для начала проверим что данных достаточно для чтения
+		if #tag_value >= 22 and #tag_value == 1 + tag_value:byte() * 21 then
+			
+			-- теперь читаем aich хеши но обычно он один
+			local aich_count, aich_list = table.unpack(("[B]{B c20}"):unpack(tag_value, 1, true), nil)
+			
+			-- выводим имя тега и количество хешей
+			io.stdout:write(tag_name, ":\t", aich_count)
+			
+			for _, aich_info in ipairs(aich_list) do
+				local   source_count -- количество источников которые задали этот хеш
+					  , aich         -- aich хеш файла
+					  = table.unpack(aich_info)
+					  
+				-- выводим количество источников и сам хеш
+				io.stdout:write("\n\t\t", source_count,  ", ", aich:tob32())
+			end
+		end
+		
+	elseif tag_name == "TAG_MEDIA_BITRATE" then
+		-- выводим битрейт
+		io.stdout:write(tag_name, ":\t", tag_value)
+		
+		-- делаем удодобочитаемый вариант
+		local shift_count, value = shift_value(tag_value)
+		
+		if shift_count == 0 then
+			io.stdout:write(" Kb/s")
+		else
+			-- пишем удодобочитаемый вариант в скобках
+			local mul = {"Mb/s", "Gb/s", "Tb/s"}
+			io.stdout:write(" Kb/s (", value, " ", mul[shift_count], ")")
+		end
+	
+	elseif tag_name == "TAG_MEDIA_LENGTH" then
+		io.stdout:write(  tag_name, ":\t"
+						, math.floor(tag_value / 60^2)    , ":" -- часы
+						, math.floor(tag_value / 60) % 60 , ":" -- минуты
+						, tag_value % 60)                       -- секунды
+		
+	elseif tag_name == "TAG_PUBLISHINFO" then
+		io.stdout:write(  tag_name, ":\t"
+						, tag_value >> 24 & 255,      "(name count), " -- количество вариантов имен файла
+						, tag_value >> 16 & 255,      "(publishers), " -- количество источников
+						, (tag_value & 0xFFFF) / 100, "(trustvalue)" ) -- уровень доверия
+		
+	elseif tag_name == "TAG_SOURCEIP" or tag_name == "TAG_SERVERIP" then	
+		io.stdout:write(tag_name, ":\t", unpack_ip(tag_value)) -- IP источника или ED2K сервера
+	
+	elseif tag_name == "TAG_FILESIZE" then	
+		io.stdout:write(tag_name, ":\t", tag_value) -- точный размер файла
+		
+		-- делаем удодобочитаемый вариант
+		local shift_count, value = shift_value(tag_value)
+		
+		if shift_count == 0 then
+			io.stdout:write(" B")
+		else
+			-- пишем удодобочитаемый вариант в скобках
+			local mul = {"KB", "MB", "GB", "TB"}
+			io.stdout:write(" B (", value, " ", mul[shift_count], ")")
+		end
+	
+	else
+		io.stdout:write(tag_name, ":\t", table.concat(tag_value_table,  ", "))
+		
+	end
+	
+	io.stdout:write("\n")
 end
 
 function check_responces(udp_port)
@@ -431,7 +551,7 @@ function main()
 		})
 		
 		if #arg <= 2 then
-			search_packet = search_packet .. "\0"
+			search_packet = search_packet .. "\0\0"
 		elseif #arg == 3 then
 			search_packet = search_packet .. "\x00\x80\1"..string.pack("<s2", arg[3])
 		end
@@ -466,7 +586,9 @@ kad.lua          [tags|t|ed2k|e] h <file hash in hex>
 	-- загружаем список стартовых узлов
 	local bootstrap_file = io.open("nodes.dat", "rb")
 	local bootstrap_list = string.unpack(bootstrap_list_format, bootstrap_file:read("*a"), 1, true)
-	local peers = #bootstrap_list[2] > 0 and bootstrap_list[2] or bootstrap_list[3][3]
+	local peers =    bootstrap_list[1] > 0 and bootstrap_list[2]              -- список узлов версия 0
+	              or bootstrap_list[3][1] == 3 and bootstrap_list[3][2][2][2] -- список узлов версия 3 (большой загрузочный список)
+				  or bootstrap_list[3][2][2]                                  -- список узлов версия 1 и 2
 	
 	-- это не полный пакет find_value
 	find_value_packet = kad2_packet_format:pack({
