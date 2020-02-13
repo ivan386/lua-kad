@@ -12,4 +12,4 @@
 	url = https://github.com/safeteeWow/LibDeflate.git
 [submodule "lua-asp"]
 	path = lua-asp
-	url = D:/Develop/lua-advanced-string-pack
+	url = https://github.com/ivan386/lua-advanced-string-pack
