@@ -49,20 +49,6 @@ local kad2_packet_format = ([[
  с4 это ipv4 адрес(перевёрнутый) за ним сразу следуют два <H это два номера порта UDP и TCP
 --]]
 
--- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/routing/RoutingZone.cpp#L135
--- формат файла списка узлов
-local bootstrap_list_format = [[
-	(*[<L]{c16 c4 <H <H B})
-	{
-		0:
-			(<L)
-			{
-				  [<L] {c16 c4 <H <H B         }
-				, [<L] {c16 c4 <H <H B c4 c4 B }
-				, (<L) {[<L] { c16 c4 <H <H B }}
-			}
-	}
-]]
 
 local MAGICVALUE_UDP_SYNC_CLIENT = ("<I4"):pack(0x395F2EC1)
 
@@ -174,7 +160,7 @@ function unpack_ip(data)
 end
 
 function reverse_hash(hash)
-	return string.pack("<L<L<L<L", string.unpack(">L>L>L>L", hash))
+	return string.pack("<LLLL", string.unpack(">LLLL", hash))
 end
 
 local find_value_packet
@@ -543,11 +529,18 @@ function main()
 		-- получаем хеш от слова
 		search_target = reverse_hash(md4(search_word))
 		
-		-- упаковываем в пакет
+		-- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/kademlia/Search.cpp#L495
+		-- пакет поиска фалов по ключевому слову
 		search_packet = kad2_packet_format:pack({
 			ED2K_PROTOCOL_KAD,
-			KADEMLIA2_SEARCH_KEY_REQ,
-			search_target
+			{
+				KADEMLIA2_SEARCH_KEY_REQ,
+				{
+					search_target       -- хеш слова по которому будет поиск
+				--	, search_terms_flag -- флаг наличия дополнительных параметров поиска (пишем вручную)
+				--  , search_terms		-- дополнительные параметры поиска (пишем вручную)
+				}
+			}
 		})
 		
 		if #arg <= 2 then
@@ -564,13 +557,17 @@ function main()
 			search_target = reverse_hash(io.stdin:read("*l"):fromhex())
 		end
 		
+		-- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/kademlia/Search.cpp#L462
+		-- пакет поиска источника файла
 		search_packet = kad2_packet_format:pack({
 			ED2K_PROTOCOL_KAD,
-			KADEMLIA2_SEARCH_SOURCE_REQ,
 			{
-				search_target
-				, 0
-				, 0 -- размер файла оставим 0 так как на результат не влияет
+				KADEMLIA2_SEARCH_SOURCE_REQ,
+				{
+					search_target
+					, 0            -- Start position range (0x0 to 0x7FFF) (не знаю что это)
+					, 0            -- размер файла. Оставим 0 так как на результат не влияет.
+				}
 			}
 		})
 	else
@@ -582,22 +579,39 @@ kad.lua          [tags|t|ed2k|e] h <file hash in hex>
 ]]
 		return
 	end
+	
+	-- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/routing/RoutingZone.cpp#L135
+	-- формат файла списка узлов
+	local bootstrap_list_format = [[
+		(*[<L]{< c16 c4 H H B})
+		{
+			0:
+				(<L)
+				{
+					  [<L] {< c16 c4 H H B         }
+					, [<L] {< c16 c4 H H B c4 c4 B }
+					, (<L) {[<L] {< c16 c4 H H B } }
+				}
+		}
+	]]
 
 	-- загружаем список стартовых узлов
 	local bootstrap_file = io.open("nodes.dat", "rb")
 	local bootstrap_list = string.unpack(bootstrap_list_format, bootstrap_file:read("*a"), 1, true)
-	local peers =    bootstrap_list[1] > 0 and bootstrap_list[2]              -- список узлов версия 0
+	local peers =    bootstrap_list[1] > 0     and bootstrap_list[2]          -- список узлов версия 0
 	              or bootstrap_list[3][1] == 3 and bootstrap_list[3][2][2][2] -- список узлов версия 3 (большой загрузочный список)
 				  or bootstrap_list[3][2][2]                                  -- список узлов версия 1 и 2
 	
-	-- это не полный пакет find_value
+	-- https://github.com/amule-project/amule/blob/c0c28234a40b1b575ce51cdfe5ffa5dac3a7494c/src/kademlia/kademlia/Search.cpp#L1088
+	-- пакет поиска ближайших узлов
 	find_value_packet = kad2_packet_format:pack({
-		ED2K_PROTOCOL_KAD,
+		ED2K_PROTOCOL_KAD, -- не сжатый пакет KAD
 		{
-			KADEMLIA2_REQ,
+			KADEMLIA2_REQ, -- поиск узлов
 			{
-				KADEMLIA_FIND_VALUE,
-				search_target
+				KADEMLIA_FIND_VALUE -- это на самом деле число ближних к search_target узлов которое мы запрашиваем
+				, search_target		-- хеш цели(хеш слова или файла или id узла) для которой мы ищем ближайшие DHT узлы
+			--  , node_id           -- id узла к которому обращаемся будет добавлен перед отправкой
 			}
 		}
 	})
