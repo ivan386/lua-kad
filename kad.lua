@@ -239,11 +239,12 @@ end
 
 function string.fromhex(hex)
 	local zero = ("0"):byte()
-	local a = ("A"):byte()
+	local A = ("A"):byte()
+	local a = ("a"):byte()
 	local data = hex:gsub("..", function(hex)
 		local b1, b2 = hex:byte(1, 2)
-		return string.char(   (b1 >= a and 10 + b1 - a or b1 - zero) << 4 
-		                    | (b2 >= a and 10 + b2 - a or b2 - zero)      )
+		return string.char(   (b1 >= a and 10 + b1 - a or b1 >= A and 10 + b1 - A or b1 - zero) << 4 
+		                    | (b2 >= a and 10 + b2 - a or b2 >= A and 10 + b2 - A or b2 - zero)      )
 	end)
     return data
 end
