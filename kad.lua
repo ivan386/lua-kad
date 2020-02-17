@@ -1,3 +1,5 @@
+-- lua 5.3.4
+
 local socket  = require "socket"
 local deflate = require "deflate.LibDeflate"
 require "lua-asp.advanced-string-pack"
@@ -16,6 +18,7 @@ local KADEMLIA2_REQ	= 0x21 -- поиск ближайших узлов
 local KADEMLIA2_RES = 0x29 -- ответ на поиск узлов
 local KADEMLIA2_SEARCH_KEY_REQ = 0x33    -- поиск файлов по слову(keyword)
 local KADEMLIA2_SEARCH_SOURCE_REQ = 0x34 -- поиск источников файла
+local KADEMLIA2_SEARCH_NOTES_REQ = 0x35  -- поиск комментариев
 local KADEMLIA2_SEARCH_RES = 0x3B        -- ответ с результатами поиска
 
 local KADEMLIA_FIND_VALUE =	0x02 -- первый байт KADEMLIA2_REQ это количество узлов запрашиваемое при поиске
@@ -30,6 +33,7 @@ local kad2_packet_format = ([[
 						,KADEMLIA2_RES               : c16 [B] {c16 c4 <H <H B}
 						,KADEMLIA2_SEARCH_KEY_REQ    : c16 ]]--[[(<H) {0x8000: (B) {0: B, <s2, <s2 <s2, <L B <s2, 8: <I8 B <s2} }]]..[[
 						,KADEMLIA2_SEARCH_SOURCE_REQ : c16 <H <I8
+						,KADEMLIA2_SEARCH_NOTES_REQ  : c16 <I8
 						,KADEMLIA2_SEARCH_RES        : c16 c16 [<H] { c16 [B] { (B) <s2 { c16, <s2, <L, <f, B,, <s4, <H, B, s1, <I8 } } }
 					}
 			,ED2K_PROTOCOL_KAD_PACKED: B
@@ -55,18 +59,20 @@ local MAGICVALUE_UDP_SYNC_CLIENT = ("<I4"):pack(0x395F2EC1)
 math.randomseed(os.time() + os.clock())
 local my_key = string.pack("<L", math.random(1 << 32 - 1))
 
-function send_packet(data, receiver_id, sender_key, ip, port, socket)
+function send_packet(data, receiver_id, ip, port, socket)
 	-- У первого байта первые два бита это тип ключа.
 	-- В случае использования в качестве ключа ID узла значение этих бит равно 0.
 	
-	local first_byte = math.random(0, 255) & (255 << 2)
+	local first_byte = math.random(0, 0x3F) << 2
 	
 	-- Необходимо проверить что значение этого байта не совпадает с идентификаторами протокола
-	-- На самом деле проверок должно быть больше. Может я и переделаю эту часть.
+	-- Проверок должно быть больше но методом исключения осталась одна.
 	
 	while first_byte == ED2K_PROTOCOL_KAD do
-		first_byte = math.random(0, 255) & (255 << 2)
+		first_byte = math.random(0, 0x3F) << 2
 	end
+	
+	first_byte = string.char(first_byte)
 	
 	-- Генерируем два случайных байта. Они участвуют в генерации ключа пакета.
 	local two_random_bytes = string.pack("<I2", math.random(1<<16 - 1))  
@@ -79,18 +85,19 @@ function send_packet(data, receiver_id, sender_key, ip, port, socket)
 	data = MAGICVALUE_UDP_SYNC_CLIENT .. "\0"
 	--        мы не знаем ключь получателя(receiver_key) поэтому заполняем его нулями
 	--        receiver_key(<I4)   sender_key(<I4)
-		   .. "\0\0\0\0"        ..sender_key      
+		   .. "\0\0\0\0"        ..my_key      
 		   ..data
 	
 	-- шифруем
 	-- в данном случае для шифрования мы используем ID получателя
-	-- мы соеденяем ID и два случайных байта и md5 от этой строки будет ключём шифрования пакета
+	-- мы соеденяем ID и два случайных байта
+	-- md5 от этой строки будет ключём шифрования пакета
 	data = rc4(md5(receiver_id..two_random_bytes), data)
 	
 	-- дополняем шифрованный пакет необходимыми для расшифрофки данными
 	-- first_byte - позволяет предположить что это шифрованный пакет
 	-- two_random_bytes - используются для генерации ключа и расшифровки
-	data = string.char(first_byte)..two_random_bytes..data
+	data = first_byte..two_random_bytes..data
 	
 	-- отправляем
 	socket:sendto(data, ip, port)
@@ -164,6 +171,7 @@ function reverse_hash(hash)
 end
 
 local find_value_packet
+local search_notes_packet
 local search_packet
 local search_target
 local checked_peers = {}
@@ -172,9 +180,12 @@ function check_peer(peer, udp_port)
 	local peer_id, peer_ip, peer_udp_port = table.unpack(peer)
 	if not checked_peers[peer_ip] then
 		checked_peers[peer_ip] = true
-		send_packet(find_value_packet..peer_id, peer_id, my_key, unpack_ip(peer_ip), peer_udp_port, udp_port)
+		send_packet(find_value_packet..peer_id, peer_id, unpack_ip(peer_ip), peer_udp_port, udp_port)
 		if search_target:byte(4) == peer_id:byte(4) then
-			send_packet(search_packet, peer_id, my_key, unpack_ip(peer_ip), peer_udp_port, udp_port)
+			send_packet(search_packet, peer_id, unpack_ip(peer_ip), peer_udp_port, udp_port)
+			if search_notes_packet then
+				send_packet(search_notes_packet, peer_id, unpack_ip(peer_ip), peer_udp_port, udp_port)
+			end
 		end
 	end
 end
@@ -212,29 +223,40 @@ local TAGS = {
 ,["\x16"] = "TAG_PERMISSIONS"
 ,["\x16"] = "TAG_QTIME"
 ,["\x17"] = "TAG_PARTS"
-,["\x33"] = "TAG_PUBLISHINFO"	-- <uint32> = <namecount uint8><publishers uint8><trustvalue*100 uint16>
-,["\x37"] = "TAG_KADAICHHASHRESULT"		-- <Count 1>{<Publishers 1><AICH Hash> Count}
+,["\x30"] = "TAG_COMPLETE_SOURCES"
+,["\x33"] = "TAG_PUBLISHINFO"	   -- <uint32> = <namecount uint8><publishers uint8><trustvalue*100 uint16>
+,["\x36"] = "TAG_KADAICHHASHPUB"    -- <AICH Hash>
+,["\x37"] = "TAG_KADAICHHASHRESULT" -- <Count 1>{<Publishers 1><AICH Hash> Count}
+
 ,["\xD0"] = "TAG_MEDIA_ARTIST"	-- <string>
 ,["\xD1"] = "TAG_MEDIA_ALBUM"	-- <string>
 ,["\xD2"] = "TAG_MEDIA_TITLE"	-- <string>
 ,["\xD3"] = "TAG_MEDIA_LENGTH"	-- <uint32> !!!
 ,["\xD4"] = "TAG_MEDIA_BITRATE"	-- <uint32>
 ,["\xD5"] = "TAG_MEDIA_CODEC"	-- <string>
+
 ,["\xF2"] = "TAG_KADMISCOPTIONS"	-- <uint8>
 ,["\xF3"] = "TAG_ENCRYPTION"	-- <uint8>
+,["\xF4"] = "TAG_USER_COUNT"	-- <uint32>
+
+,["\xF5"] = "TAG_FILE_COUNT"	-- <uint32>
+,["\xF6"] = "TAG_FILECOMMENT"	-- <string>
 ,["\xF7"] = "TAG_FILERATING"	-- <uint8>
-,["\xF8"] = "TAG_BUDDYHASH"	-- <string>
+
+,["\xF8"] = "TAG_BUDDYHASH"	    -- <string>
 ,["\xF9"] = "TAG_CLIENTLOWID"	-- <uint32>
 ,["\xFA"] = "TAG_SERVERPORT"	-- <uint16>
-,["\xFB"] = "TAG_SERVERIP"	-- <uint32>
+,["\xFB"] = "TAG_SERVERIP"	    -- <uint32>
 ,["\xFC"] = "TAG_SOURCEUPORT"	-- <uint16>
 ,["\xFD"] = "TAG_SOURCEPORT"	-- <uint16>
-,["\xFE"] = "TAG_SOURCEIP"	-- <uint32>
+,["\xFE"] = "TAG_SOURCEIP"	    -- <uint32>
 ,["\xFF"] = "TAG_SOURCETYPE"	-- <uint8>
 }
 function string.tohex(data)
-	local hex = data:gsub(".", function(chr) return ("%02X"):format(chr:byte()) end)
-    return hex
+	if #data == 16 then
+		return ("%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X")
+		:format(data:byte(1,-1))
+	end
 end
 
 function string.fromhex(hex)
@@ -443,8 +465,7 @@ function print_tag(tag_name, tag_value, tag_value_table)
 			io.stdout:write(" Kb/s")
 		else
 			-- пишем удодобочитаемый вариант в скобках
-			local mul = {"Mb/s", "Gb/s", "Tb/s"}
-			io.stdout:write(" Kb/s (", value, " ", mul[shift_count], ")")
+			io.stdout:write(" Kb/s (", value, " ", select(shift_count, "Mb/s", "Gb/s", "Tb/s"), ")")
 		end
 	
 	elseif tag_name == "TAG_MEDIA_LENGTH" then
@@ -472,11 +493,15 @@ function print_tag(tag_name, tag_value, tag_value_table)
 			io.stdout:write(" B")
 		else
 			-- пишем удодобочитаемый вариант в скобках
-			local mul = {"KB", "MB", "GB", "TB"}
-			io.stdout:write(" B (", value, " ", mul[shift_count], ")")
+			io.stdout:write(" B (", value, " ", select(shift_count, "KB", "MB", "GB", "TB"), ")")
 		end
 	
 	else
+		for i, v in pairs(tag_value_table) do
+			if type(v) == "string" then
+				tag_value_table[i] = string.format("%q", v)
+			end
+		end
 		io.stdout:write(tag_name, ":\t", table.concat(tag_value_table,  ", "))
 		
 	end
@@ -544,6 +569,17 @@ function main()
 			}
 		})
 		
+		search_notes_packet = kad2_packet_format:pack({
+			ED2K_PROTOCOL_KAD,
+			{
+				KADEMLIA2_SEARCH_NOTES_REQ,
+				{
+					search_target
+					, 0            -- размер файла. Оставим 0 так как на результат не влияет.
+				}
+			}
+		})
+		
 		if #arg <= 2 then
 			search_packet = search_packet .. "\0\0"
 		elseif #arg == 3 then
@@ -573,10 +609,10 @@ function main()
 		})
 	else
 		print [[
-kad.lua [tags|t|ed2k|e|magnet|m] keyword <string>
-kad.lua [tags|t|ed2k|e|magnet|m] k <string>
-kad.lua          [tags|t|ed2k|e] hash <file hash in hex>
-kad.lua          [tags|t|ed2k|e] h <file hash in hex>
+kad.lua [tags|t|ed2k|e|magnet|m] keyword <string> [<string>]
+kad.lua [tags|t|ed2k|e|magnet|m] k       <string> [<string>]
+kad.lua [tags|t|ed2k|e]          hash <file hash in hex>
+kad.lua [tags|t|ed2k|e]          h    <file hash in hex>
 ]]
 		return
 	end
